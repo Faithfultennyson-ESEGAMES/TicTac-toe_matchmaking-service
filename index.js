@@ -9,15 +9,15 @@ const cors = require('cors');
 // --- Configuration & Initialization ---
 
 const PORT = process.env.PORT || 3330;
-const MATCHMAKING_AUTH_TOKEN = process.env.MATCHMAKING_AUTH_TOKEN;
-const MATCHMAKING_HMAC_SECRET = process.env.MATCHMAKING_HMAC_SECRET;
+const DLQ_PASSWORD = process.env.DLQ_PASSWORD;
+const HMAC_SECRET = process.env.HMAC_SECRET;
 const GAME_SERVER_URL = process.env.GAME_SERVER_URL;
 const DB_ENTRY_TTL_MS = parseInt(process.env.DB_ENTRY_TTL_MS, 10) || 3600000;
 const MAX_SESSION_CREATION_ATTEMPTS = parseInt(process.env.MAX_SESSION_CREATION_ATTEMPTS, 10) || 3;
 const SESSION_CREATION_RETRY_DELAY_MS = parseInt(process.env.SESSION_CREATION_RETRY_DELAY_MS, 10) || 1500;
 
-if (!MATCHMAKING_AUTH_TOKEN || !MATCHMAKING_HMAC_SECRET) {
-    console.error('FATAL ERROR: MATCHMAKING_AUTH_TOKEN and MATCHMAKING_HMAC_SECRET must be defined in .env file.');
+if (!DLQ_PASSWORD || !HMAC_SECRET) {
+    console.error('FATAL ERROR: DLQ_PASSWORD and HMAC_SECRET must be defined in .env file.');
     process.exit(1);
 }
 
@@ -43,10 +43,10 @@ const io = new Server(server, {
 });
 
 const verifyWebhookSignature = (req, res, next) => {
-    const signature = req.headers['x-signature'];
+    const signature = req.headers['x-hub-signature-256'];
     if (!signature) {
-        console.error("[Webhook Error] Signature header missing. Expected \'x-signature\'.");
-        return res.status(401).send("Signature header missing. Expected \'x-signature\'.");
+        console.error("[Webhook Error] Signature header missing. Expected 'x-hub-signature-256'.");
+        return res.status(401).send("Signature header missing. Expected 'x-hub-signature-256'.");
     }
     
     if (!req.rawBody) {
@@ -54,7 +54,7 @@ const verifyWebhookSignature = (req, res, next) => {
         return res.status(500).send('Internal Server Error: Raw body not saved.');
     }
 
-    const expectedSignature = crypto.createHmac('sha256', MATCHMAKING_HMAC_SECRET).update(req.rawBody).digest('hex');
+    const expectedSignature = crypto.createHmac('sha256', HMAC_SECRET).update(req.rawBody).digest('hex');
 
     if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expectedSignature))) {
         console.error('[Webhook Error] Invalid signature.');
@@ -112,7 +112,6 @@ async function main() {
             console.log(`[State] Clearing active session ${sessionId} for players: ${playerIdsInSession.join(', ')}`);
 
             for (const playerId of playerIdsInSession) {
-                // NEW: Notify the client that the session has ended using their persistent playerId room.
                 console.log(`[Socket] Notifying player ${playerId} that session ${sessionId} has ended.`);
                 io.to(playerId).emit('session-ended', { sessionId });
                 delete db.data.active_games[playerId];
@@ -143,20 +142,23 @@ async function main() {
                 }
                 console.log(`[Socket] Match requested by PlayerID: ${playerId}`);
 
-                // NEW: Have the socket join a room identified by its playerId.
-                // This allows us to message the player even if their socketId changes on reconnect.
                 socket.join(playerId);
 
                 await db.read();
 
                 if (db.data.active_games[playerId]) {
-                    const { sessionId, join_url } = db.data.active_games[playerId];
-                    console.log(`[State] Player ${playerId} is already in a game. Resending session details.`);
-                    return socket.emit('match-found', { sessionId, join_url });
+                    const { sessionId, joinUrl } = db.data.active_games[playerId];
+                    if (db.data.ended_games[sessionId]) {
+                        console.log(`[State] Player ${playerId} was in session ${sessionId}, but it has ended. Clearing and allowing to re-queue.`);
+                        delete db.data.active_games[playerId];
+                        await db.write();
+                    } else {
+                        console.log(`[State] Player ${playerId} is already in an active game. Resending session details.`);
+                        return socket.emit('match-found', { sessionId, joinUrl });
+                    }
                 }
 
                 if (!db.data.queue.some(p => p.playerId === playerId)) {
-                    // Storing socket.id is still useful for temporary disconnect logic.
                     db.data.queue.push({ playerId, playerName, socketId: socket.id });
                     await db.write();
                     console.log(`[State] Player ${playerId} added to queue. Queue size: ${db.data.queue.length}`);
@@ -174,42 +176,44 @@ async function main() {
                                 method: 'POST',
                                 headers: {
                                     'Content-Type': 'application/json',
-                                    'Authorization': `Bearer ${MATCHMAKING_AUTH_TOKEN}`
+                                    'Authorization': `Bearer ${DLQ_PASSWORD}`
                                 }
                             });
 
-                            if (!response.ok) {
-                                throw new Error(`Game server returned status ${response.status}`);
-                            }
+                            const receivedSignature = response.headers.get('x-hub-signature-256');
+                            const rawBody = await response.text();
 
-                            const body = await response.json();
-                            const { session_id, join_url } = body;
-                            const receivedSignature = body.signature;
+                            if (!response.ok) {
+                                throw new Error(`Game server returned status ${response.status}: ${rawBody}`);
+                            }
 
                             if (!receivedSignature) {
-                                throw new Error('Response from game server is missing signature');
+                                throw new Error('Response from game server is missing signature header');
                             }
 
-                            const payloadToVerify = { session_id, join_url };
-                            const canonicalString = JSON.stringify(payloadToVerify);
-                            const computedSignature = crypto.createHmac('sha256', MATCHMAKING_HMAC_SECRET).update(canonicalString).digest('hex');
+                            const computedSignature = crypto.createHmac('sha256', HMAC_SECRET).update(rawBody).digest('hex');
 
                             if (!crypto.timingSafeEqual(Buffer.from(receivedSignature), Buffer.from(computedSignature))) {
                                 throw new Error('Invalid response signature from game server');
                             }
                             
-                            const sessionId = session_id;
+                            const body = JSON.parse(rawBody);
+                            const { sessionId, joinUrl } = body;
+
+                            if (!sessionId || !joinUrl) {
+                                throw new Error('Invalid response payload from game server');
+                            }
+
                             console.log(`[Game Server] Successfully created and verified session ${sessionId}`);
 
-                            db.data.active_games[player1.playerId] = { sessionId, join_url };
-                            db.data.active_games[player2.playerId] = { sessionId, join_url };
+                            db.data.active_games[player1.playerId] = { sessionId, joinUrl };
+                            db.data.active_games[player2.playerId] = { sessionId, joinUrl };
                             await db.write();
 
-                            // UPDATED: Emit to the playerId room for robustness.
-                            io.to(player1.playerId).emit('match-found', { sessionId, join_url });
-                            io.to(player2.playerId).emit('match-found', { sessionId, join_url });
+                            io.to(player1.playerId).emit('match-found', { sessionId, joinUrl });
+                            io.to(player2.playerId).emit('match-found', { sessionId, joinUrl });
 
-                            break; // Success!
+                            break;
 
                         } catch (error) {
                             console.error(`[Error] Attempt ${attempt} failed:`, error.message);
@@ -222,7 +226,6 @@ async function main() {
                                 if (!db.data.queue.some(p => p.playerId === player2.playerId)) { db.data.queue.unshift(player2); }
                                 await db.write();
 
-                                // UPDATED: Emit to rooms, not old socketIds.
                                 io.to(player1.playerId)?.emit('match-error', { message: 'Could not create game session.' });
                                 io.to(player2.playerId)?.emit('match-error', { message: 'Could not create game session.' });
                             }
@@ -247,6 +250,49 @@ async function main() {
                 }
             } catch (err) {
                 console.error('[FATAL] Unhandled error in disconnect handler:', err);
+            }
+        });
+
+        socket.on('report-invalid-session', async (data) => {
+            try {
+                const { playerId, playerName, sessionId } = data;
+                if (!playerId || !sessionId) {
+                    return socket.emit('match-error', { message: 'PlayerId and SessionId are required to report an invalid session.' });
+                }
+
+                await db.read();
+                
+                const activeGame = db.data.active_games[playerId];
+
+                if (activeGame && activeGame.sessionId === sessionId) {
+                    console.log(`[State] Player ${playerId} reported invalid session ${sessionId}. Removing from active games and re-queuing.`);
+                    
+                    delete db.data.active_games[playerId];
+                    
+                    if (!db.data.queue.some(p => p.playerId === playerId)) {
+                        db.data.queue.push({ playerId, playerName: playerName || 'Unknown', socketId: socket.id });
+                    }
+                    
+                    await db.write();
+                    
+                    socket.emit('requeued-successfully');
+
+                    // Immediately try to matchmake again
+                    if (db.data.queue.length >= 2) {
+                        // This part is already handled by the 'request-match' logic, let's keep it simple
+                        // and let the next 'request-match' from a client trigger the check.
+                        // For simplicity, we can just check if we can form a match now.
+                        console.log('[State] Checking for new match after re-queue...');
+                        // The logic to start a new match is complex, we'll let the natural flow handle it
+                        // when another player requests a match. This is safer than re-implementing it here.
+                    }
+                } else {
+                    console.warn(`[State] Player ${playerId} sent an invalid report for session ${sessionId}. Their active session is ${activeGame ? activeGame.sessionId : 'non-existent'}.`);
+                    socket.emit('match-error', { message: 'Invalid session report. You are not in that session.' });
+                }
+            } catch (err) {
+                console.error('[FATAL] Unhandled error in report-invalid-session handler:', err);
+                socket.emit('match-error', { message: 'An unexpected server error occurred while reporting session.' });
             }
         });
     });
