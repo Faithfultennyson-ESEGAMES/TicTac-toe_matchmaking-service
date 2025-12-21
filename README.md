@@ -200,9 +200,9 @@ Common errors:
 
 ### 3. Handling Invalid Sessions (Client-Side Recovery)
 
-In rare cases, a client may be assigned to a session that is invalid (e.g., the game client fails to connect, or the session is already full or seems to be over). If a client cannot successfully join the game specified in `match-found`, it should report the session as invalid to be re-queued. This prevents the player from being "stuck" in a broken session.
+In rare cases, a client may be assigned to a session that is invalid (e.g., the game client fails to connect, or the session is already full or seems to be over). If a client cannot successfully join the game specified in `match-found`, it should report the session as invalid so the server can clear the active session entry. The client can then decide when to call `request-match` again.
 
-**`report-invalid-session`**: Sent by the client to report a broken session and request to be re-queued.
+**`report-invalid-session`**: Sent by the client to report a broken session and clear the active session entry.
 
 ```javascript
 // Let's say you stored the sessionId from the 'match-found' event
@@ -218,13 +218,12 @@ const reportPayload = {
 socket.emit('report-invalid-session', reportPayload);
 ```
 
-**`requeued-successfully`**: The server confirms the report was valid and the player is now back in the matchmaking queue.
+**`session-cleared`**: The server confirms the report was valid and the player was removed from the active session.
 
 ```javascript
-socket.on('requeued-successfully', () => {
-    console.log('Server confirmed our report. We are back in the queue.');
-    // Update UI to show "Searching for a new match..."
-    // The server will automatically try to find a new match for you.
+socket.on('session-cleared', () => {
+    console.log('Server confirmed our report. You can request a new match.');
+    // Update UI to show "Find Match" or "Play Again".
 });
 ```
 

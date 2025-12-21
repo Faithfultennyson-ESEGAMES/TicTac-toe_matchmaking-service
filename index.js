@@ -503,7 +503,7 @@ async function main() {
 
         socket.on('report-invalid-session', async (data) => {
             try {
-                const { playerId, playerName, sessionId } = data || {};
+                const { playerId, sessionId } = data || {};
                 if (!playerId || !sessionId) {
                     return socket.emit('match-error', { message: 'playerId and sessionId are required to report an invalid session.' });
                 }
@@ -514,27 +514,14 @@ async function main() {
                 const activeGame = db.data.active_games[playerId];
 
                 if (activeGame && activeGame.sessionId === sessionId) {
-                    console.log(`[State] Player ${playerId} reported invalid session ${sessionId}. Removing from active games and re-queuing.`);
-                    
-                    const gameType = activeGame.gameType || 'tictactoe';
-                    const mode = activeGame.mode || 2;
-                    delete db.data.active_games[playerId];
+                    console.log(`[State] Player ${playerId} reported invalid session ${sessionId}. Clearing active game entry.`);
 
-                    removeFromQueues(db.data, playerId);
-                    const queueBucket = getQueueBucket(db.data, gameType, mode);
-                    queueBucket.push({
-                        playerId,
-                        playerName: playerName || 'Unknown',
-                        socketId: socket.id,
-                        gameType,
-                        mode,
-                        queuedAt: new Date().toISOString()
-                    });
+                    delete db.data.active_games[playerId];
+                    const removedFromQueue = removeFromQueues(db.data, playerId);
 
                     await db.write();
-                    socket.emit('requeued-successfully');
+                    socket.emit('session-cleared', { playerId, sessionId, removedFromQueue });
                     broadcastQueueStatus();
-                    attemptMatchmaking(gameType, mode);
                 } else {
                     console.warn(`[State] Player ${playerId} sent an invalid report for session ${sessionId}. Their active session is ${activeGame ? activeGame.sessionId : 'non-existent'}.`);
                     socket.emit('match-error', { message: 'Invalid session report. You are not in that session.' });
