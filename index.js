@@ -21,6 +21,8 @@ const REDIS_PORT = parseInt(process.env.REDIS_PORT, 10);
 const REDIS_USERNAME = process.env.REDIS_USERNAME;
 const REDIS_PASSWORD = process.env.REDIS_PASSWORD;
 const REDIS_USE_TLS = String(process.env.REDIS_USE_TLS || 'true').toLowerCase() === 'true';
+const AUTH_REQUIRED = String(process.env.AUTH_REQUIRED || 'false').toLowerCase() === 'true';
+const SUPABASE_JWT_SECRET = process.env.SUPABASE_JWT_SECRET;
 const DICE_TURN_TIME_MS = parseInt(process.env.DICE_TURN_TIME_MS, 10) || 8000;
 const TICTACTOE_TURN_DURATION_SEC = parseInt(process.env.TICTACTOE_TURN_DURATION_SEC, 10) || 6;
 const CARD_TURN_DURATION_SEC = parseInt(process.env.CARD_TURN_DURATION_SEC, 10) || 10;
@@ -47,6 +49,11 @@ if (!REDIS_URL && (!REDIS_HOST || !REDIS_PORT)) {
     process.exit(1);
 }
 
+if (AUTH_REQUIRED && !SUPABASE_JWT_SECRET) {
+    console.error('FATAL ERROR: AUTH_REQUIRED is true but SUPABASE_JWT_SECRET is missing.');
+    process.exit(1);
+}
+
 const app = express();
 const server = http.createServer(app);
 
@@ -67,6 +74,19 @@ const io = new Server(server, {
         methods: ["GET", "POST"]
     }
 });
+
+if (AUTH_REQUIRED) {
+    io.use((socket, next) => {
+        const token = getSocketAuthToken(socket);
+        const result = verifySupabaseJwt(token);
+        if (!result.ok) {
+            console.warn('[Auth] Socket connection rejected:', result.reason);
+            return next(new Error('unauthorized'));
+        }
+        socket.auth = { userId: result.payload?.sub || null };
+        return next();
+    });
+}
 
 const verifyWebhookSignature = (req, res, next) => {
     const signature = req.headers['x-hub-signature-256'];
@@ -191,6 +211,74 @@ function normalizeMode(gameType, mode) {
     return DICE_MODES.includes(parsed) ? parsed : null;
 }
 
+function base64UrlEncode(buffer) {
+    return Buffer.from(buffer)
+        .toString('base64')
+        .replace(/=/g, '')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_');
+}
+
+function base64UrlDecode(value) {
+    const safe = (value || '').replace(/-/g, '+').replace(/_/g, '/');
+    const padded = safe.padEnd(safe.length + (4 - (safe.length % 4 || 4)), '=');
+    return Buffer.from(padded, 'base64').toString('utf8');
+}
+
+function getSocketAuthToken(socket) {
+    const authToken = socket.handshake?.auth?.token;
+    if (authToken) return authToken;
+    const header = socket.handshake?.headers?.authorization || '';
+    if (typeof header === 'string' && header.toLowerCase().startsWith('bearer ')) {
+        return header.slice(7).trim();
+    }
+    return null;
+}
+
+function verifySupabaseJwt(token) {
+    if (!token || !SUPABASE_JWT_SECRET) {
+        return { ok: false, reason: 'missing_token' };
+    }
+
+    const parts = token.split('.');
+    if (parts.length !== 3) {
+        return { ok: false, reason: 'malformed_token' };
+    }
+
+    const [headerB64, payloadB64, signatureB64] = parts;
+    let header = null;
+    let payload = null;
+
+    try {
+        header = JSON.parse(base64UrlDecode(headerB64));
+        payload = JSON.parse(base64UrlDecode(payloadB64));
+    } catch (error) {
+        return { ok: false, reason: 'invalid_token_json' };
+    }
+
+    if (!header || header.alg !== 'HS256') {
+        return { ok: false, reason: 'unsupported_alg' };
+    }
+
+    const expected = base64UrlEncode(
+        crypto.createHmac('sha256', SUPABASE_JWT_SECRET).update(`${headerB64}.${payloadB64}`).digest()
+    );
+
+    if (expected.length !== signatureB64.length) {
+        return { ok: false, reason: 'invalid_signature' };
+    }
+
+    if (!crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signatureB64))) {
+        return { ok: false, reason: 'invalid_signature' };
+    }
+
+    if (payload && payload.exp && Date.now() >= payload.exp * 1000) {
+        return { ok: false, reason: 'token_expired' };
+    }
+
+    return { ok: true, payload };
+}
+
 function getClientIp(socket) {
     const forwarded = socket.handshake.headers['x-forwarded-for'];
     if (forwarded) {
@@ -226,6 +314,16 @@ function resolveOutcome(payload, playerId) {
 
 function createLobbyId() {
     return crypto.randomUUID();
+}
+
+function generateVoiceChannel(sessionId, lobbyId = null) {
+    if (lobbyId) {
+        return `lobby_${lobbyId}`;
+    }
+    if (sessionId) {
+        return `session_${sessionId}`;
+    }
+    return null;
 }
 
 function parseLobbyConfig(gameType, rawConfig) {
@@ -286,6 +384,9 @@ async function touchPrivateLobbyKeys(lobbyId) {
 
 async function persistLobby(lobby) {
     lobby.updatedAt = new Date().toISOString();
+    if (!lobby.voiceChannel) {
+        lobby.voiceChannel = generateVoiceChannel(lobby.sessionId, lobby.lobbyId);
+    }
     await redisClient.set(getPrivateLobbyKey(lobby.lobbyId), JSON.stringify(lobby), { PX: DB_ENTRY_TTL_MS });
     await touchPrivateLobbyKeys(lobby.lobbyId);
 }
@@ -319,6 +420,7 @@ async function buildLobbyState(lobbyId) {
         playerCount: lobby.playerCount,
         inGame: lobby.inGame,
         sessionId: lobby.sessionId,
+        voiceChannel: lobby.voiceChannel || generateVoiceChannel(lobby.sessionId, lobby.lobbyId),
         players,
         connectedCount: connectedIds.size,
         createdAt: lobby.createdAt,
@@ -865,6 +967,7 @@ async function attemptMatchmaking(gameType, mode) {
             }
 
             const { sessionId, joinUrl } = sessionResult;
+            const voiceChannel = generateVoiceChannel(sessionId);
             const sessionKey = getActiveGameSessionKey(sessionId);
             for (const entry of candidates) {
                 const activeKey = getActiveGamePlayerKey(entry.playerId);
@@ -873,6 +976,7 @@ async function attemptMatchmaking(gameType, mode) {
                     joinUrl,
                     gameType,
                     mode,
+                    voiceChannel,
                     createdAt: new Date().toISOString()
                 }), { PX: ACTIVE_GAMES_TTL_MS });
                 await redisClient.sAdd(sessionKey, entry.playerId);
@@ -884,7 +988,7 @@ async function attemptMatchmaking(gameType, mode) {
             }
 
             for (const entry of candidates) {
-                io.to(entry.playerId).emit('match-found', { sessionId, joinUrl, gameType, mode });
+                io.to(entry.playerId).emit('match-found', { sessionId, joinUrl, gameType, mode, voiceChannel });
             }
         }
 
@@ -925,10 +1029,26 @@ async function main() {
 
             console.log(`[State] Clearing active session ${sessionId} for players: ${playerIdsInSession.join(', ')}`);
 
+            const fallbackGameType = normalizeGameType(
+                req.body?.gameType || req.body?.game_type || req.body?.game?.type
+            );
+
             for (const playerId of playerIdsInSession) {
                 console.log(`[Socket] Notifying player ${playerId} that session ${sessionId} has ended.`);
+                let gameType = fallbackGameType || null;
+                const activeRaw = await redisClient.get(getActiveGamePlayerKey(playerId));
+                if (activeRaw) {
+                    try {
+                        const activeGame = JSON.parse(activeRaw);
+                        if (activeGame?.gameType) {
+                            gameType = normalizeGameType(activeGame.gameType) || gameType;
+                        }
+                    } catch (error) {
+                    }
+                }
                 io.to(playerId).emit('session-ended', {
                     sessionId,
+                    gameType,
                     outcome: resolveOutcome(req.body, playerId)
                 });
                 await redisClient.del(getActiveGamePlayerKey(playerId));
@@ -1137,6 +1257,7 @@ async function main() {
                     config: parsed.config,
                     inGame: false,
                     sessionId: null,
+                    voiceChannel: generateVoiceChannel(null, lobbyId),
                     createdAt: now,
                     updatedAt: now,
                     lastActivityAt: now,
@@ -1361,6 +1482,7 @@ async function main() {
                 }
 
                 const { sessionId, joinUrl } = sessionResult;
+                const voiceChannel = lobby.voiceChannel || generateVoiceChannel(sessionId, lobby.lobbyId);
                 const sessionKey = getActiveGameSessionKey(sessionId);
                 const now = new Date().toISOString();
 
@@ -1371,6 +1493,7 @@ async function main() {
                         joinUrl,
                         gameType: lobby.gameType,
                         mode: lobby.mode,
+                        voiceChannel,
                         createdAt: now
                     }), { PX: ACTIVE_GAMES_TTL_MS });
                     await redisClient.sAdd(sessionKey, playerIdInLobby);
@@ -1386,6 +1509,7 @@ async function main() {
 
                 lobby.inGame = true;
                 lobby.sessionId = sessionId;
+                lobby.voiceChannel = voiceChannel;
                 lobby.lastActivityAt = now;
                 lobby.emptySince = null;
                 await persistLobby(lobby);
