@@ -43,6 +43,21 @@ const PRIVATE_LOBBY_EMPTY_GRACE_MS = parseInt(process.env.PRIVATE_LOBBY_EMPTY_GR
 const DICE_MODES = [2, 4, 6, 15];
 const CARD_MODES = [2, 3, 4, 5, 6];
 const CLEANUP_INTERVAL_MS = Math.min(300000, DB_ENTRY_TTL_MS);
+const nodeMajor = parseInt(process.versions.node.split('.')[0], 10);
+if (Number.isFinite(nodeMajor) && nodeMajor < 18) {
+    console.warn(`[Matchmaking] Node ${process.versions.node} detected. JWKS verification requires Node 18+.`);
+}
+if (!globalThis.crypto) {
+    try {
+        const { webcrypto } = require('crypto');
+        if (webcrypto) {
+            globalThis.crypto = webcrypto;
+            console.warn('[Matchmaking] WebCrypto polyfill enabled for JWKS verification.');
+        }
+    } catch (error) {
+        console.warn('[Matchmaking] WebCrypto polyfill failed:', error?.message || error);
+    }
+}
 
 if (!DLQ_PASSWORD || !HMAC_SECRET || !DICE_GAME_SERVER_URL || !TICTACTOE_GAME_SERVER_URL || !CARD_GAME_SERVER_URL) {
     console.error('FATAL ERROR: DLQ_PASSWORD, HMAC_SECRET, DICE_GAME_SERVER_URL, TICTACTOE_GAME_SERVER_URL, and CARD_GAME_SERVER_URL must be defined in .env file.');
