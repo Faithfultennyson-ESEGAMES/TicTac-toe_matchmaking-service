@@ -408,12 +408,14 @@ async function buildLobbyState(lobbyId) {
                 playerId: data.playerId,
                 playerName: data.playerName,
                 joinedAt: data.joinedAt,
-                connected: connectedIds.has(data.playerId)
+                connected: connectedIds.has(data.playerId),
+                ready: Boolean(data.ready)
             };
         } catch (error) {
             return null;
         }
     }).filter(Boolean);
+    const readyCount = players.filter((player) => player.ready).length;
 
     return {
         lobbyId: lobby.lobbyId,
@@ -426,6 +428,7 @@ async function buildLobbyState(lobbyId) {
         sessionId: lobby.sessionId,
         voiceChannel: lobby.voiceChannel || generateVoiceChannel(lobby.sessionId, lobby.lobbyId),
         players,
+        readyCount,
         connectedCount: connectedIds.size,
         createdAt: lobby.createdAt,
         updatedAt: lobby.updatedAt,
@@ -459,9 +462,21 @@ async function hydrateLobbyForSocket(socket, playerId) {
     await redisClient.del(getPrivateLobbyDisconnectKey(playerId));
     socket.join(getPrivateLobbyRoom(lobbyId));
 
+    const playerRaw = await redisClient.hGet(getPrivateLobbyPlayersKey(lobbyId), playerId);
+    if (playerRaw) {
+        try {
+            const data = JSON.parse(playerRaw);
+            data.ready = false;
+            await redisClient.hSet(getPrivateLobbyPlayersKey(lobbyId), playerId, JSON.stringify(data));
+        } catch (error) {
+            // ignore invalid player data
+        }
+    }
+
     const state = await buildLobbyState(lobbyId);
     if (state) {
         socket.emit('private-lobby-joined', state);
+        io.to(getPrivateLobbyRoom(lobbyId)).emit('private-lobby-updated', state);
     }
 }
 
@@ -1330,7 +1345,8 @@ async function main() {
                     playerName,
                     joinedAt: now,
                     ip: getClientIp(socket),
-                    deviceId: deviceId || null
+                    deviceId: deviceId || null,
+                    ready: false
                 };
 
                 const previousSocketId = await redisClient.get(getPrivateLobbyPlayerSocketKey(playerId));
@@ -1413,7 +1429,8 @@ async function main() {
                     playerName,
                     joinedAt,
                     ip: getClientIp(socket),
-                    deviceId: deviceId || null
+                    deviceId: deviceId || null,
+                    ready: false
                 };
 
                 const previousSocketId = await redisClient.get(getPrivateLobbyPlayerSocketKey(playerId));
@@ -1440,6 +1457,99 @@ async function main() {
             } catch (err) {
                 console.error('[FATAL] Unhandled error in join-private-lobby handler:', err);
                 socket.emit('match-error', { message: 'An unexpected server error occurred while joining a lobby.' });
+            }
+        });
+
+        socket.on('update-private-lobby', async (data) => {
+            try {
+                const { lobbyId, playerId, gameType: rawGameType, config } = data || {};
+                if (!lobbyId || !playerId) {
+                    return socket.emit('match-error', { message: 'lobbyId and playerId are required.' });
+                }
+                const lobby = await loadLobby(lobbyId);
+                if (!lobby) {
+                    return socket.emit('match-error', { message: 'Private lobby not found.' });
+                }
+                if (lobby.adminPlayerId !== playerId) {
+                    return socket.emit('match-error', { message: 'Only the lobby admin can update the lobby.' });
+                }
+                if (lobby.inGame) {
+                    return socket.emit('match-error', { message: 'Cannot update lobby while a match is in progress.' });
+                }
+
+                const gameType = normalizeGameType(rawGameType);
+                if (!gameType) {
+                    return socket.emit('match-error', { message: 'Invalid gameType. Use dice, tictactoe, or card.' });
+                }
+
+                const parsed = parseLobbyConfig(gameType, config);
+                if (parsed.error) {
+                    return socket.emit('match-error', { message: parsed.error });
+                }
+
+                const playerMap = await redisClient.hGetAll(getPrivateLobbyPlayersKey(lobbyId));
+                const currentCount = Object.keys(playerMap).length;
+                const nextCount = parsed.config.playerCount || parsed.mode;
+                if (currentCount > nextCount) {
+                    return socket.emit('match-error', { message: 'New lobby size is smaller than current players.' });
+                }
+
+                lobby.gameType = gameType;
+                lobby.mode = parsed.mode;
+                lobby.config = parsed.config;
+                lobby.playerCount = nextCount;
+                lobby.lastActivityAt = new Date().toISOString();
+                lobby.emptySince = null;
+
+                const entries = Object.entries(playerMap);
+                for (const [memberId, raw] of entries) {
+                    try {
+                        const stored = JSON.parse(raw);
+                        stored.ready = false;
+                        await redisClient.hSet(getPrivateLobbyPlayersKey(lobbyId), memberId, JSON.stringify(stored));
+                    } catch (error) {
+                        // ignore malformed entries
+                    }
+                }
+
+                await persistLobby(lobby);
+                await emitLobbyUpdate(lobbyId);
+            } catch (err) {
+                console.error('[FATAL] Unhandled error in update-private-lobby handler:', err);
+                socket.emit('match-error', { message: 'An unexpected server error occurred while updating a lobby.' });
+            }
+        });
+
+        socket.on('set-lobby-ready', async (data) => {
+            try {
+                const { lobbyId, playerId, ready } = data || {};
+                if (!lobbyId || !playerId) {
+                    return socket.emit('match-error', { message: 'lobbyId and playerId are required.' });
+                }
+                const lobby = await loadLobby(lobbyId);
+                if (!lobby) {
+                    return socket.emit('match-error', { message: 'Private lobby not found.' });
+                }
+                if (lobby.inGame) {
+                    return socket.emit('match-error', { message: 'Cannot change ready state during a match.' });
+                }
+                const playerRaw = await redisClient.hGet(getPrivateLobbyPlayersKey(lobbyId), playerId);
+                if (!playerRaw) {
+                    return socket.emit('match-error', { message: 'Player is not in this lobby.' });
+                }
+                try {
+                    const stored = JSON.parse(playerRaw);
+                    stored.ready = Boolean(ready);
+                    await redisClient.hSet(getPrivateLobbyPlayersKey(lobbyId), playerId, JSON.stringify(stored));
+                } catch (error) {
+                    return socket.emit('match-error', { message: 'Invalid player data in lobby.' });
+                }
+                lobby.lastActivityAt = new Date().toISOString();
+                await persistLobby(lobby);
+                await emitLobbyUpdate(lobbyId);
+            } catch (err) {
+                console.error('[FATAL] Unhandled error in set-lobby-ready handler:', err);
+                socket.emit('match-error', { message: 'An unexpected server error occurred while updating readiness.' });
             }
         });
 
@@ -1519,6 +1629,22 @@ async function main() {
                 const connectedCount = await redisClient.sCard(getPrivateLobbyConnectedKey(lobbyId));
                 if (playerIds.length !== lobby.playerCount || connectedCount !== lobby.playerCount) {
                     return socket.emit('match-error', { message: 'Lobby must be full and all players connected before starting.' });
+                }
+
+                const notReady = [];
+                playerIds.forEach((memberId) => {
+                    try {
+                        const stored = JSON.parse(playerMap[memberId]);
+                        if (!stored.ready) {
+                            notReady.push({ playerId: stored.playerId, playerName: stored.playerName || stored.playerId });
+                        }
+                    } catch (error) {
+                        notReady.push({ playerId: memberId, playerName: memberId });
+                    }
+                });
+                if (notReady.length > 0) {
+                    io.to(getPrivateLobbyRoom(lobbyId)).emit('private-lobby-not-ready', { lobbyId, notReady });
+                    return socket.emit('match-error', { message: 'All players must be ready before starting.' });
                 }
 
                 const sessionResult = await createSessionFromConfig(lobby.gameType, lobby.config);
