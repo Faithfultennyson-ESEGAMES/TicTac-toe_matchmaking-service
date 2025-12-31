@@ -1361,7 +1361,7 @@ async function main() {
 
         socket.on('join-private-lobby', async (data) => {
             try {
-                const { lobbyId, playerId, playerName, gameType: rawGameType, config, deviceId } = data || {};
+                const { lobbyId, playerId, playerName, deviceId } = data || {};
                 if (!lobbyId || !playerId || !playerName) {
                     return socket.emit('match-error', { message: 'lobbyId, playerId, and playerName are required.' });
                 }
@@ -1389,25 +1389,7 @@ async function main() {
                     return socket.emit('match-error', { message: 'You are already in another private lobby.' });
                 }
 
-                if (rawGameType) {
-                    const gameType = normalizeGameType(rawGameType);
-                    if (gameType && gameType !== lobby.gameType) {
-                        return socket.emit('match-error', { message: 'Lobby game type does not match.' });
-                    }
-                }
-
-                if (config) {
-                    const parsed = parseLobbyConfig(lobby.gameType, config);
-                    if (parsed.error) {
-                        return socket.emit('match-error', { message: parsed.error });
-                    }
-                    const configMatches = parsed.mode === lobby.mode
-                        && parsed.config.turnDurationSec === lobby.config.turnDurationSec
-                        && parsed.config.turnTimeMs === lobby.config.turnTimeMs;
-                    if (!configMatches) {
-                        return socket.emit('match-error', { message: 'Lobby config does not match.' });
-                    }
-                }
+                // Ignore client gameType/config; lobby settings are the source of truth.
 
                 const playerMap = await redisClient.hGetAll(getPrivateLobbyPlayersKey(lobbyId));
                 const isMember = Object.prototype.hasOwnProperty.call(playerMap, playerId);
